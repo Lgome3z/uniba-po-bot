@@ -1,0 +1,27 @@
+# SECURITY - NEVER COMMIT THESE
+.ssh/
+.bash_history
+.docker/
+.Xauthority
+
+# Caches & Remote Server Data (Huge files, do not track)
+.cache/
+.vscode-server/
+.local/
+.dotnet/
+
+# Session Logs & History
+.wget-hsts
+.xsession-errors
+.xsession-errors.old
+.sudo_as_admin_successful
+
+# Default Media & Document Folders
+Desktop/
+Documents/
+Downloads/
+Music/
+Pictures/
+Public/
+Templates/
+Videos/
