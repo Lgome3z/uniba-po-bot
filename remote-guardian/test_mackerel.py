@@ -1,7 +1,0 @@
-print("# mackerel-meta")
-print("outfocus")
-print("[graph.guardian]")
-print("label = \"Remote Guardian\"")
-print("[graph.guardian.metrics.mic_level]")
-print("label = \"Mic Level (dB)\"")
-print("guardian.mic_level\t-55\t1784005486")
