@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  web-controller:
+    build: ./api
+    container_name: guardian_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
