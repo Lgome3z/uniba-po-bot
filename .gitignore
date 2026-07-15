@@ -11,7 +11,7 @@
 .dotnet/
 .gemini/
 .antigravity-ide-server/
-.config/
+.gitconfig
 
 # Session Logs & History
 .wget-hsts
