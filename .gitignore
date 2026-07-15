@@ -9,6 +9,9 @@
 .vscode-server/
 .local/
 .dotnet/
+.gemini/
+.antigravity-ide-server/
+.gitconfig
 
 # Session Logs & History
 .wget-hsts
