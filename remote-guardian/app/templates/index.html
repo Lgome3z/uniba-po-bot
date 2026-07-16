@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PO-Bot Gateway Status</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        .status-card { border: 1px solid #ccc; padding: 20px; border-radius: 8px; max-width: 400px; }
+        .online { color: green; font-weight: bold; }
+        .offline { color: red; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>Remote Guardian Status</h1>
+    <div class="status-card">
+        <p>Status: <span id="status" class="{% if online %}online{% else %}offline{% endif %}">
+            {{ "ONLINE" if online else "OFFLINE" }}
+        </span></p>
+        <p>Last Seen: {{ last_seen_at }}</p>
+        <hr>
+        <h3>Latest Sensor Data:</h3>
+        <pre>{{ sensor_data | tojson(indent=2) }}</pre>
+    </div>
+</body>
+</html>

@@ -1,9 +1,21 @@
 version: '3.8'
 
 services:
-  web-controller:
-    build: ./api
-    container_name: guardian_api
+  gateway:
+    build: ./app
+    container_name: po_bot_gateway
     restart: unless-stopped
+    env_file:
+      - .env
+    # devices:
+      # This maps the physical USB device into the container
+      # It will fail to start if the device is not plugged in unless you handle it,
+      # but we use try-except in Python so it just keeps retrying inside.
+      # Note: Docker might still complain if the host path doesn't exist.
+      # A more robust production solution is to use privileged mode or bind mount /dev,
+      # but this is standard for simple setups.
+      # - /dev/po-bot-m5:/dev/po-bot-m5
+    environment:
+      - PYTHONUNBUFFERED=1
     ports:
       - "8000:8000"

@@ -3,6 +3,8 @@
 .bash_history
 .docker/
 .Xauthority
+.env
+.env.example
 
 # Caches & Remote Server Data (Huge files, do not track)
 .cache/

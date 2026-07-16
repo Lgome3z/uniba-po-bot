@@ -1,0 +1,5 @@
+# Udev rule to assign a persistent name to M5Stack USB serial
+# TODO: Update idVendor and idProduct once the M5Stack is plugged in.
+# You can find these values by running `lsusb` after plugging the device in.
+# Example: ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001" (for ESP32-S3)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="<PLACEHOLDER_VENDOR_ID>", ATTRS{idProduct}=="<PLACEHOLDER_PRODUCT_ID>", SYMLINK+="po-bot-m5"
