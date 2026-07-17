@@ -6,32 +6,23 @@ import serial
 
 from config import USB_PORT, BAUD_RATE, MACKEREL_API_KEY, MACKEREL_URL, MACKEREL_HOST_ID
 from state import gateway_state
+from communication import read_packet, assemble_message, handle_message
 
 async def read_serial_loop():
-    """Background task reading from USB Serial with auto-reconnect."""
+    """Background task reading binary packets from USB Serial with auto-reconnect."""
     ser = None
     while True:
         try:
             if not ser or not ser.is_open:
                 print(f"Attempting to connect to {USB_PORT}...")
-                # In a real asyncio app, you might use aiofiles or run serial in an executor,
-                # but for simplicity and low throughput, we can use a small timeout and yield.
                 ser = serial.Serial(USB_PORT, BAUD_RATE, timeout=0.1)
                 print(f"Connected to {USB_PORT}")
 
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8').strip()
-                if line:
-                    try:
-                        data = json.loads(line)
-                        if data.get("type") == "sensor.reading":
-                            gateway_state["sensor_data"] = data
-                            gateway_state["last_seen_at"] = int(time.time())
-                            gateway_state["online"] = True
-                            print(f"Read sensor data: {data}")
-                    except json.JSONDecodeError:
-                        print(f"Malformed JSON from serial: {line}")
-                        
+            packet = read_packet(ser)
+            if packet is not None:
+                message = assemble_message(packet)
+                handle_message(message)
+
         except serial.SerialException as e:
             print(f"Serial Error: {e}. Retrying in 2 seconds...")
             if ser:
@@ -44,7 +35,7 @@ async def read_serial_loop():
 async def mackerel_exporter_loop():
     """Background task posting metrics to Mackerel."""
     while True:
-        await asyncio.sleep(60) # Post metrics every 60 seconds
+        await asyncio.sleep(5) # Post metrics every 5 seconds
         
         if not MACKEREL_API_KEY or MACKEREL_API_KEY == "your_mackerel_api_key_here":
             print("Mackerel exporter: API key not set or is placeholder, skipping.")
