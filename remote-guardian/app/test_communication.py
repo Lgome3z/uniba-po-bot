@@ -22,6 +22,7 @@ from communication import (
     PacketType,
     Packet,
     Message,
+    PacketWriter,
     HEADER_SIZE,
     CRC_SIZE,
     START_MARKER,
@@ -46,6 +47,26 @@ class MockSerial:
 
     def read(self, size: int = 1) -> bytes:
         return self._buf.read(size)
+
+
+class MockSerialWriter:
+    """
+    A minimal mock that captures bytes written via .write(),
+    then exposes them through MockSerial for read-back.
+    """
+    def __init__(self):
+        self._chunks: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        self._chunks.append(bytes(data))
+
+    @property
+    def packets_written(self) -> list[bytes]:
+        return list(self._chunks)
+
+    def as_reader(self) -> MockSerial:
+        """Return a MockSerial containing all written data for read-back."""
+        return MockSerial(b"".join(self._chunks))
 
 
 # ── Helper: Build a valid binary packet ──────────────────────────────────────
@@ -396,3 +417,132 @@ class TestEndToEnd:
 
         assert gateway_state["sensor_data"]["temperature_c"] == 30.0
         assert gateway_state["sensor_data"]["co2_ppm"] == 450
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PacketWriter Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPacketWriter:
+    def test_sequence_increments(self):
+        """next_sequence() should return 1, 2, 3, …"""
+        writer = PacketWriter()
+        assert writer.next_sequence() == 1
+        assert writer.next_sequence() == 2
+        assert writer.next_sequence() == 3
+
+    def test_sequence_wraps_at_16_bits(self):
+        """Sequence should wrap around after 0xFFFF."""
+        writer = PacketWriter()
+        writer._sequence = 0xFFFE
+        assert writer.next_sequence() == 0xFFFF
+        assert writer.next_sequence() == 0
+
+    def test_item_id_increments(self):
+        """next_item_id() should return 1, 2, 3, …"""
+        writer = PacketWriter()
+        assert writer.next_item_id() == 1
+        assert writer.next_item_id() == 2
+        assert writer.next_item_id() == 3
+
+    def test_single_packet_roundtrip(self):
+        """A short payload should produce one packet parseable by read_packet."""
+        writer = PacketWriter()
+        mock_ser = MockSerialWriter()
+
+        writer.write_packet(mock_ser, PacketType.Text, b"Hello World")
+
+        assert len(mock_ser.packets_written) == 1
+
+        reader = mock_ser.as_reader()
+        packet = read_packet(reader)
+
+        assert packet is not None
+        assert packet.type == PacketType.Text
+        assert packet.payload == b"Hello World"
+        assert packet.fragment_index == 0
+        assert packet.fragment_count == 1
+        assert packet.item_id == 1
+        assert packet.sequence == 1
+
+    def test_crc_integrity(self):
+        """The CRC in the written packet should match a fresh computation."""
+        writer = PacketWriter()
+        mock_ser = MockSerialWriter()
+
+        writer.write_packet(mock_ser, PacketType.Command, b"ping")
+
+        raw = mock_ser.packets_written[0]
+        body = raw[:-CRC_SIZE]
+        expected_crc = crc16_ccitt_false(body)
+        actual_crc = struct.unpack('>H', raw[-CRC_SIZE:])[0]
+
+        assert actual_crc == expected_crc
+
+    def test_empty_payload(self):
+        """Writing zero-length data should produce a valid single packet."""
+        writer = PacketWriter()
+        mock_ser = MockSerialWriter()
+
+        writer.write_packet(mock_ser, PacketType.Text, b"")
+
+        assert len(mock_ser.packets_written) == 1
+
+        reader = mock_ser.as_reader()
+        packet = read_packet(reader)
+
+        assert packet is not None
+        assert packet.payload_length == 0
+        assert packet.payload == b""
+        assert packet.fragment_count == 1
+
+    def test_fragmented_packet_roundtrip(self):
+        """A payload larger than MAX_PAYLOAD should be split into multiple fragments."""
+        writer = PacketWriter()
+        mock_ser = MockSerialWriter()
+
+        payload = bytes(range(256)) * 9  # 2304 bytes → 2 fragments
+        writer.write_packet(mock_ser, PacketType.Video, payload)
+
+        assert len(mock_ser.packets_written) == 2
+
+        # read_packet() rejects fragment_count > 1, so validate the raw bytes directly
+        reassembled = b""
+        for idx, raw in enumerate(mock_ser.packets_written):
+            assert raw[:2] == START_MARKER
+
+            pkt_type, seq, item_id, frag_idx, frag_cnt, pay_len = struct.unpack(
+                '>BHIHHH', raw[2:HEADER_SIZE]
+            )
+            assert pkt_type == int(PacketType.Video)
+            assert frag_idx == idx
+            assert frag_cnt == 2
+            assert item_id == 1
+
+            frag_payload = raw[HEADER_SIZE:HEADER_SIZE + pay_len]
+            reassembled += frag_payload
+
+            # Verify CRC
+            body = raw[:HEADER_SIZE + pay_len]
+            expected_crc = crc16_ccitt_false(body)
+            actual_crc = struct.unpack('>H', raw[HEADER_SIZE + pay_len:])[0]
+            assert actual_crc == expected_crc
+
+        assert reassembled == payload
+
+    def test_exact_max_payload_no_extra_fragment(self):
+        """A payload of exactly MAX_PAYLOAD bytes should produce 1 fragment."""
+        writer = PacketWriter()
+        mock_ser = MockSerialWriter()
+
+        payload = bytes(range(256)) * 8  # exactly 2048
+        writer.write_packet(mock_ser, PacketType.Audio, payload)
+
+        assert len(mock_ser.packets_written) == 1
+
+        reader = mock_ser.as_reader()
+        packet = read_packet(reader)
+
+        assert packet is not None
+        assert packet.payload == payload
+        assert packet.fragment_count == 1

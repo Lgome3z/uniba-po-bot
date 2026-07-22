@@ -1,11 +1,17 @@
 """
 communication.py — Python port of the M5's binary communication protocol.
 
-Implements the read side of the packet protocol:
-  - crc16_ccitt_false(): CRC-16/CCITT-FALSE checksum
-  - read_packet(): parse a binary packet from a serial stream
-  - assemble_message(): convert a Packet into a Message
-  - handle_message(): dispatch a Message based on its type
+Implements both sides of the packet protocol:
+
+  Read:
+    - crc16_ccitt_false(): CRC-16/CCITT-FALSE checksum
+    - read_packet(): parse a binary packet from a serial stream
+    - assemble_message(): convert a Packet into a Message
+    - handle_message(): dispatch a Message based on its type
+
+  Write:
+    - PacketWriter: stateful writer that fragments data, assembles packets,
+      computes CRC, and sends them over serial.
 
 Packet wire format (big-endian):
   [0xAA][0x55][type:1][seq:2][itemID:4][fragIdx:2][fragCnt:2][payLen:2][payload:N][crc:2]
@@ -14,20 +20,19 @@ Packet wire format (big-endian):
 
 import struct
 import json
+import time
 from enum import IntEnum
 from dataclasses import dataclass, field
 from typing import Optional
+from ctypes import c_uint8, c_uint16, c_uint32
 
 from state import gateway_state
-
-# Protocol constants (must match Communication.h)
 
 MAX_PAYLOAD  = 2048
 HEADER_SIZE  = 15
 CRC_SIZE     = 2
 START_MARKER = b'\xAA\x55'
-
-# PacketType enum
+HEADER_FORMAT = '>BHIHHH'
 
 class PacketType(IntEnum):
     Text    = 0
@@ -37,38 +42,26 @@ class PacketType(IntEnum):
     Command = 4
     JSON    = 5
 
-# Data structures
-
 @dataclass
 class Packet:
     type: PacketType
-    sequence: int
-    item_id: int
-    fragment_index: int
-    fragment_count: int
-    payload_length: int
+    sequence: c_uint16
+    item_id: c_uint32
+    fragment_index: c_uint16
+    fragment_count: c_uint16
+    payload_length: c_uint16
     payload: bytes
 
 
 @dataclass
 class Message:
     type: PacketType
-    item_id: int
-    length: int
+    item_id: c_uint16
+    length: c_uint16
     data: bytes
 
-# CRC-16/CCITT-FALSE
-
-def crc16_ccitt_false(data: bytes) -> int:
-    """
-    Compute CRC-16/CCITT-FALSE.
-
-    Polynomial: 0x1021
-    Initial value: 0xFFFF
-    No final XOR, no bit reversal.
-
-    This is a direct port of the C++ crc16() function.
-    """
+def crc16_ccitt_false(data: bytes) -> c_uint16:
+    """Compute CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF)."""
     crc = 0xFFFF
     for byte in data:
         crc ^= byte << 8
@@ -80,74 +73,44 @@ def crc16_ccitt_false(data: bytes) -> int:
     return crc
 
 
-# read_packet
+def _scan_for_start_marker(ser) -> bool:
+    """Consume bytes from *ser* until the 0xAA 0x55 start marker is found."""
+    while ser.in_waiting >= 2:
+        if ser.read(1) == b'\xAA' and ser.read(1) == b'\x55':
+            return True
+    return False
+
 
 def read_packet(ser) -> Optional[Packet]:
-    """
-    Read and parse a single binary packet from the serial port.
+    """Read and parse a single binary packet from the serial port.
 
-    Port of Communication::readPacket().
-
-    Steps:
-      1. Scan for the 0xAA 0x55 start marker.
-      2. Read the remaining 13 header bytes.
-      3. Parse and validate header fields.
-      4. Read payload and CRC.
-      5. Verify CRC over header + payload.
+    Scans for the start marker, reads the header and payload, validates
+    the CRC, and returns a Packet — or None if no valid packet is available.
 
     Args:
         ser: A serial.Serial instance (or any object with
-             .in_waiting, .read(), .peek()-like behaviour).
-
-    Returns:
-        A Packet on success, or None if no valid packet is available.
+             .in_waiting and .read()).
     """
-
-    # We need at least 2 bytes to look for the marker.
     if ser.in_waiting < 2:
         return None
 
-    found_marker = False
-    while ser.in_waiting >= 2:
-        b = ser.read(1)
-        if b == b'\xAA':
-            # Peek at the next byte without consuming it if possible,
-            # but pyserial doesn't have peek(). Read and check.
-            next_b = ser.read(1)
-            if next_b == b'\x55':
-                found_marker = True
-                break
-            # If next_b wasn't 0x55, it might itself be 0xAA,
-            # so we need to check it. But since we already consumed it,
-            # we can only continue scanning.
-    if not found_marker:
+    if not _scan_for_start_marker(ser):
         return None
 
-    remaining_header_size = HEADER_SIZE - 2  # 13 bytes
-    if ser.in_waiting < remaining_header_size:
+    remaining_header = HEADER_SIZE - len(START_MARKER)
+    if ser.in_waiting < remaining_header:
         return None
 
-    header_rest = ser.read(remaining_header_size)
-    if len(header_rest) < remaining_header_size:
+    header_rest = ser.read(remaining_header)
+    if len(header_rest) < remaining_header:
         return None
 
-    # Layout after start marker (13 bytes):
-    #   B  = uint8  (type)        = 1 byte
-    #   H  = uint16 (sequence)    = 2 bytes
-    #   I  = uint32 (itemID)      = 4 bytes
-    #   H  = uint16 (fragIndex)   = 2 bytes
-    #   H  = uint16 (fragCount)   = 2 bytes
-    #   H  = uint16 (payloadLen)  = 2 bytes
-    #   Total = 1+2+4+2+2+2 = 13 bytes
     pkt_type_raw, sequence, item_id, frag_idx, frag_cnt, payload_length = struct.unpack(
-        '>BHIHHH', header_rest
+        HEADER_FORMAT, header_rest
     )
 
-    # Validate: no multi-fragment support yet (matches C++ behaviour)
     if frag_cnt > 1:
         return None
-
-    # Validate: payload length within bounds
     if payload_length > MAX_PAYLOAD:
         return None
 
@@ -168,10 +131,7 @@ def read_packet(ser) -> Optional[Packet]:
         return None
 
     received_crc = struct.unpack('>H', crc_bytes)[0]
-
-    # CRC is computed over the full header (including start marker) + payload
-    full_header = START_MARKER + header_rest
-    calculated_crc = crc16_ccitt_false(full_header + payload)
+    calculated_crc = crc16_ccitt_false(START_MARKER + header_rest + payload)
 
     if received_crc != calculated_crc:
         return None
@@ -187,36 +147,22 @@ def read_packet(ser) -> Optional[Packet]:
     )
 
 
-# assemble_message
-
 def assemble_message(packet: Packet) -> Message:
-    """
-    Convert a parsed Packet into a Message.
+    """Convert a parsed Packet into a Message.
 
-    Port of Communication::assembleMessage().
-
-    Currently a straightforward copy since multi-fragment reassembly
-    is not yet supported (fragment_count is validated to be <= 1 in read_packet).
+    Multi-fragment reassembly is not yet supported; fragment_count is
+    validated to be <= 1 in read_packet.
     """
     return Message(
         type=packet.type,
         item_id=packet.item_id,
         length=packet.payload_length,
-        data=bytes(packet.payload),  # defensive copy
+        data=bytes(packet.payload),
     )
 
 
-# handle_message
-
 def handle_message(message: Message) -> None:
-    """
-    Dispatch a Message based on its type.
-
-    Port of Communication::handleMessage(), extended to also handle
-    Sensors and JSON types for gateway_state integration.
-    """
-    import time
-
+    """Dispatch a Message based on its PacketType."""
     if message.type == PacketType.Text:
         text = message.data.decode('utf-8', errors='replace')
         print(f"Received Text: {text}")
@@ -241,3 +187,88 @@ def handle_message(message: Message) -> None:
     else:
         print(f"Received unhandled packet type: {message.type.name} "
               f"({message.length} bytes)")
+
+
+# PacketWriter
+
+class PacketWriter:
+    """Stateful packet writer that mirrors the C++ Communication class.
+
+    Maintains incrementing sequence and item_id counters and handles
+    fragmenting large payloads across multiple packets.
+    """
+
+    def __init__(self):
+        self._sequence: c_uint16 = 0
+        self._item_id: c_uint32 = 0
+
+    def next_sequence(self) -> c_uint16:
+        """Increment and return the next 16-bit sequence number."""
+        self._sequence = (self._sequence + 1) & 0xFFFF
+        return self._sequence
+
+    def next_item_id(self) -> c_uint32:
+        """Increment and return the next 32-bit item ID."""
+        self._item_id = (self._item_id + 1) & 0xFFFFFFFF
+        return self._item_id
+
+    @staticmethod
+    def _calculate_fragment_count(length: c_uint32) -> c_uint16:
+        """Return the number of MAX_PAYLOAD-sized fragments needed for *length* bytes."""
+        return (length + MAX_PAYLOAD - 1) // MAX_PAYLOAD if length > 0 else 1
+
+    @staticmethod
+    def _assemble_packet(
+        packet_type: PacketType,
+        sequence: c_uint16,
+        item_id: c_uint32,
+        fragment_index: c_uint16,
+        fragment_count: c_uint16,
+        payload: bytes,
+    ) -> bytes:
+        """Build a complete packet (header + payload + CRC) as bytes.
+
+        The returned bytes are ready to be written directly to the serial port.
+        """
+        header = START_MARKER + struct.pack(
+            '>BHIHHH',
+            int(packet_type),
+            sequence,
+            item_id,
+            fragment_index,
+            fragment_count,
+            len(payload),
+        )
+        body = header + payload
+        crc = crc16_ccitt_false(body)
+        return body + struct.pack('>H', crc)
+
+    def write_packet(self, ser, packet_type: PacketType, data: bytes) -> None:
+        """Fragment *data* and write one or more packets to the serial port.
+
+        This is a direct port of Communication::writePacket().
+        Each fragment is assembled into a full packet with CRC and written
+        immediately.
+
+        Args:
+            ser: An open serial.Serial instance (or any object with .write()).
+            packet_type: The PacketType enum value for this data.
+            data: The raw payload bytes to send.
+        """
+        item_id = self.next_item_id()
+        fragment_count = self._calculate_fragment_count(len(data))
+
+        for i in range(fragment_count):
+            offset = i * MAX_PAYLOAD
+            fragment = data[offset:offset + MAX_PAYLOAD]
+
+            packet = self._assemble_packet(
+                packet_type,
+                self.next_sequence(),
+                item_id,
+                i,
+                fragment_count,
+                fragment,
+            )
+
+            ser.write(packet)

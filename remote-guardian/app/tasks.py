@@ -1,21 +1,28 @@
 import asyncio
 import json
+import sys
 import time
 import requests
 import serial
 
 from config import USB_PORT, BAUD_RATE, MACKEREL_API_KEY, MACKEREL_URL, MACKEREL_HOST_ID
 from state import gateway_state
-from communication import read_packet, assemble_message, handle_message
+from communication import read_packet, assemble_message, handle_message, PacketWriter, PacketType
+
+# Shared serial port instance and packet writer for background tasks
+active_serial: serial.Serial | None = None
+packet_writer = PacketWriter()
 
 async def read_serial_loop():
     """Background task reading binary packets from USB Serial with auto-reconnect."""
+    global active_serial
     ser = None
     while True:
         try:
             if not ser or not ser.is_open:
                 print(f"Attempting to connect to {USB_PORT}...")
                 ser = serial.Serial(USB_PORT, BAUD_RATE, timeout=0.1)
+                active_serial = ser
                 print(f"Connected to {USB_PORT}")
 
             packet = read_packet(ser)
@@ -27,6 +34,8 @@ async def read_serial_loop():
             print(f"Serial Error: {e}. Retrying in 2 seconds...")
             if ser:
                 ser.close()
+            active_serial = None
+            ser = None
             gateway_state["online"] = False
             await asyncio.sleep(2)
             
@@ -94,3 +103,20 @@ async def monitor_online_status():
                 print("No data received for 15+ seconds. Marking as offline.")
                 gateway_state["online"] = False
         await asyncio.sleep(5)
+
+async def send_loop():
+    """Test: sending 'Hello World' text packet to M5 every 5 seconds."""
+    while True:
+        await asyncio.sleep(5)
+
+        if not active_serial or not active_serial.is_open:
+            print(f"Send loop: {USB_PORT} not connected yet, waiting...")
+            continue
+
+        message = b"Hello World!!!"
+        try:
+            packet_writer.write_packet(active_serial, PacketType.Text, message)
+            print(f"Sent Text packet: {message.decode()!r} ({len(message)} bytes)")
+        except Exception as e:
+            print(f"Send loop error: {e}")
+
