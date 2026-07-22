@@ -7,11 +7,14 @@ import serial
 
 from config import USB_PORT, BAUD_RATE, MACKEREL_API_KEY, MACKEREL_URL, MACKEREL_HOST_ID
 from state import gateway_state
-from communication import read_packet, assemble_message, handle_message, PacketWriter, PacketType
+from communication import (
+    read_packet, handle_message, PacketWriter, PacketType, MessageAssembler,
+)
 
 # Shared serial port instance and packet writer for background tasks
 active_serial: serial.Serial | None = None
 packet_writer = PacketWriter()
+assembler = MessageAssembler()
 
 async def read_serial_loop():
     """Background task reading binary packets from USB Serial with auto-reconnect."""
@@ -27,8 +30,11 @@ async def read_serial_loop():
 
             packet = read_packet(ser)
             if packet is not None:
-                message = assemble_message(packet)
-                handle_message(message)
+                message = assembler.assemble(packet)
+                if message is not None:
+                    handle_message(message)
+
+            assembler.cleanup()
 
         except serial.SerialException as e:
             print(f"Serial Error: {e}. Retrying in 2 seconds...")
@@ -59,12 +65,10 @@ async def mackerel_exporter_loop():
         }
         gateway_state["last_seen_at"] = int(time.time())
 
-        # Original check commented out:
-        # if not gateway_state["online"] or not gateway_state["sensor_data"]:
-        #     print("Mackerel exporter: Gateway offline or no data, skipping.")
-        #     continue
+        if not gateway_state["online"] or not gateway_state["sensor_data"]:
+            print("Mackerel exporter: Gateway offline or no data, skipping.")
+            continue
             
-        # Prepare metrics according to step 2
         now = int(time.time())
         data = gateway_state["sensor_data"]
         metrics = []

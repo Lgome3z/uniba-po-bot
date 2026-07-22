@@ -6,7 +6,7 @@ Implements both sides of the packet protocol:
   Read:
     - crc16_ccitt_false(): CRC-16/CCITT-FALSE checksum
     - read_packet(): parse a binary packet from a serial stream
-    - assemble_message(): convert a Packet into a Message
+    - MessageAssembler: reassemble single or multi-fragment packets into Messages
     - handle_message(): dispatch a Message based on its type
 
   Write:
@@ -33,6 +33,9 @@ HEADER_SIZE  = 15
 CRC_SIZE     = 2
 START_MARKER = b'\xAA\x55'
 HEADER_FORMAT = '>BHIHHH'
+MAX_PARTIAL_MESSAGES = 4
+PARTIAL_MESSAGE_TIMEOUT = 5.0
+
 
 class PacketType(IntEnum):
     Text    = 0
@@ -41,6 +44,7 @@ class PacketType(IntEnum):
     Video   = 3
     Command = 4
     JSON    = 5
+
 
 @dataclass
 class Packet:
@@ -56,9 +60,23 @@ class Packet:
 @dataclass
 class Message:
     type: PacketType
-    item_id: c_uint16
-    length: c_uint16
+    item_id: c_uint32
+    length: c_uint32
     data: bytes
+
+
+@dataclass
+class _PartialMessage:
+    """Internal slot for tracking an in-progress multi-fragment message."""
+    in_use: bool = False
+    type: PacketType = PacketType.Text
+    item_id: c_uint32 = 0
+    fragment_count: c_uint16 = 0
+    last_received: c_uint16 = 0
+    received_length: c_uint32 = 0
+    data: bytearray = field(default_factory=bytearray)
+    last_update_time: float = 0.0
+
 
 def crc16_ccitt_false(data: bytes) -> c_uint16:
     """Compute CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF)."""
@@ -109,8 +127,6 @@ def read_packet(ser) -> Optional[Packet]:
         HEADER_FORMAT, header_rest
     )
 
-    if frag_cnt > 1:
-        return None
     if payload_length > MAX_PAYLOAD:
         return None
 
@@ -147,18 +163,117 @@ def read_packet(ser) -> Optional[Packet]:
     )
 
 
-def assemble_message(packet: Packet) -> Message:
-    """Convert a parsed Packet into a Message.
+class MessageAssembler:
+    """Reassembles single and multi-fragment packets into complete Messages.
 
-    Multi-fragment reassembly is not yet supported; fragment_count is
-    validated to be <= 1 in read_packet.
+    Port of the C++ assembleMessage / partialMessages system.
+    Maintains a fixed-size pool of partial message slots and evicts
+    the oldest slot when all are in use.
     """
-    return Message(
-        type=packet.type,
-        item_id=packet.item_id,
-        length=packet.payload_length,
-        data=bytes(packet.payload),
-    )
+
+    def __init__(self, max_slots: int = MAX_PARTIAL_MESSAGES,
+                 timeout: float = PARTIAL_MESSAGE_TIMEOUT):
+        self._slots = [_PartialMessage() for _ in range(max_slots)]
+        self._timeout = timeout
+
+    def assemble(self, packet: Packet) -> Optional[Message]:
+        """Feed a Packet in and get a complete Message back, or None.
+
+        Returns a Message when all fragments for an item have arrived
+        in order. Returns None if more fragments are still expected or
+        if the packet was out of order (in which case the partial state
+        is discarded).
+        """
+        if packet.fragment_count == 1:
+            return Message(
+                type=packet.type,
+                item_id=packet.item_id,
+                length=packet.payload_length,
+                data=bytes(packet.payload),
+            )
+
+        for slot in self._slots:
+            if slot.in_use and slot.item_id == packet.item_id:
+                return self._append_to_slot(slot, packet)
+
+        return self._start_new_slot(packet)
+
+    def cleanup(self) -> None:
+        """Discard partial messages that have not received a fragment recently."""
+        now = time.monotonic()
+        for slot in self._slots:
+            if slot.in_use and (now - slot.last_update_time) > self._timeout:
+                self._clear_slot(slot)
+
+    def _append_to_slot(self, slot: _PartialMessage, packet: Packet) -> Optional[Message]:
+        """Append a fragment to an existing partial message slot."""
+        if slot.last_received != packet.fragment_index - 1:
+            self._clear_slot(slot)
+            return None
+
+        slot.last_received = packet.fragment_index
+        slot.data.extend(packet.payload)
+        slot.received_length += packet.payload_length
+        slot.last_update_time = time.monotonic()
+
+        if slot.fragment_count == slot.last_received + 1:
+            message = Message(
+                type=slot.type,
+                item_id=slot.item_id,
+                length=slot.received_length,
+                data=bytes(slot.data),
+            )
+            self._clear_slot(slot)
+            return message
+
+        return None
+
+    def _start_new_slot(self, packet: Packet) -> None:
+        """Allocate a slot for the first fragment of a new multi-part message."""
+        if packet.fragment_index != 0:
+            return None
+
+        target = self._slots[0]
+        for slot in self._slots:
+            if not slot.in_use:
+                target = slot
+                break
+            if slot.last_update_time < target.last_update_time:
+                target = slot
+
+        self._clear_slot(target)
+        target.in_use = True
+        target.type = packet.type
+        target.item_id = packet.item_id
+        target.fragment_count = packet.fragment_count
+        target.last_received = 0
+        target.received_length = packet.payload_length
+        target.last_update_time = time.monotonic()
+        target.data = bytearray(packet.payload)
+        return None
+
+    @staticmethod
+    def _clear_slot(slot: _PartialMessage) -> None:
+        """Reset a partial message slot to its default state."""
+        slot.in_use = False
+        slot.type = PacketType.Text
+        slot.item_id = 0
+        slot.fragment_count = 0
+        slot.last_received = 0
+        slot.received_length = 0
+        slot.data = bytearray()
+        slot.last_update_time = 0.0
+
+
+def assemble_message(packet: Packet) -> Optional[Message]:
+    """Convenience wrapper for single-fragment packets (backwards compatible).
+
+    For multi-fragment support, use a MessageAssembler instance instead.
+    """
+    return _default_assembler.assemble(packet)
+
+
+_default_assembler = MessageAssembler()
 
 
 def handle_message(message: Message) -> None:
@@ -188,8 +303,6 @@ def handle_message(message: Message) -> None:
         print(f"Received unhandled packet type: {message.type.name} "
               f"({message.length} bytes)")
 
-
-# PacketWriter
 
 class PacketWriter:
     """Stateful packet writer that mirrors the C++ Communication class.
@@ -246,7 +359,6 @@ class PacketWriter:
     def write_packet(self, ser, packet_type: PacketType, data: bytes) -> None:
         """Fragment *data* and write one or more packets to the serial port.
 
-        This is a direct port of Communication::writePacket().
         Each fragment is assembled into a full packet with CRC and written
         immediately.
 
@@ -272,3 +384,4 @@ class PacketWriter:
             )
 
             ser.write(packet)
+

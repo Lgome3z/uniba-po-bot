@@ -23,6 +23,7 @@ from communication import (
     Packet,
     Message,
     PacketWriter,
+    MessageAssembler,
     HEADER_SIZE,
     CRC_SIZE,
     START_MARKER,
@@ -248,12 +249,14 @@ class TestReadPacket:
         packet = read_packet(ser)
         assert packet is None
 
-    def test_fragment_count_greater_than_1_returns_none(self):
-        """Packets with fragment_count > 1 should be rejected (not yet supported)."""
-        raw = build_raw_packet(fragment_count=3)
+    def test_fragment_count_greater_than_1_parses(self):
+        """Packets with fragment_count > 1 should now parse successfully."""
+        raw = build_raw_packet(fragment_count=3, fragment_index=0)
         ser = MockSerial(raw)
         packet = read_packet(ser)
-        assert packet is None
+        assert packet is not None
+        assert packet.fragment_count == 3
+        assert packet.fragment_index == 0
 
     def test_all_packet_types(self):
         """Every PacketType enum value should parse correctly."""
@@ -283,6 +286,7 @@ class TestAssembleMessage:
         )
         message = assemble_message(packet)
 
+        assert message is not None
         assert message.type == PacketType.Text
         assert message.item_id == 7
         assert message.length == 12
@@ -302,7 +306,7 @@ class TestAssembleMessage:
         )
         message = assemble_message(packet)
 
-        # Mutating the original payload should not affect the message
+        assert message is not None
         payload[0] = 0xFF
         assert message.data[0] != 0xFF
 
@@ -391,6 +395,7 @@ class TestEndToEnd:
         assert packet is not None
 
         message = assemble_message(packet)
+        assert message is not None
         handle_message(message)
 
         captured = capsys.readouterr()
@@ -413,6 +418,7 @@ class TestEndToEnd:
         assert packet is not None
 
         message = assemble_message(packet)
+        assert message is not None
         handle_message(message)
 
         assert gateway_state["sensor_data"]["temperature_c"] == 30.0
@@ -497,38 +503,29 @@ class TestPacketWriter:
         assert packet.fragment_count == 1
 
     def test_fragmented_packet_roundtrip(self):
-        """A payload larger than MAX_PAYLOAD should be split into multiple fragments."""
+        """A payload larger than MAX_PAYLOAD should be split and reassembled."""
         writer = PacketWriter()
         mock_ser = MockSerialWriter()
+        asm = MessageAssembler()
 
         payload = bytes(range(256)) * 9  # 2304 bytes → 2 fragments
         writer.write_packet(mock_ser, PacketType.Video, payload)
 
         assert len(mock_ser.packets_written) == 2
 
-        # read_packet() rejects fragment_count > 1, so validate the raw bytes directly
-        reassembled = b""
-        for idx, raw in enumerate(mock_ser.packets_written):
-            assert raw[:2] == START_MARKER
+        message = None
+        for raw in mock_ser.packets_written:
+            reader = MockSerial(raw)
+            packet = read_packet(reader)
+            assert packet is not None
+            result = asm.assemble(packet)
+            if result is not None:
+                message = result
 
-            pkt_type, seq, item_id, frag_idx, frag_cnt, pay_len = struct.unpack(
-                '>BHIHHH', raw[2:HEADER_SIZE]
-            )
-            assert pkt_type == int(PacketType.Video)
-            assert frag_idx == idx
-            assert frag_cnt == 2
-            assert item_id == 1
-
-            frag_payload = raw[HEADER_SIZE:HEADER_SIZE + pay_len]
-            reassembled += frag_payload
-
-            # Verify CRC
-            body = raw[:HEADER_SIZE + pay_len]
-            expected_crc = crc16_ccitt_false(body)
-            actual_crc = struct.unpack('>H', raw[HEADER_SIZE + pay_len:])[0]
-            assert actual_crc == expected_crc
-
-        assert reassembled == payload
+        assert message is not None
+        assert message.type == PacketType.Video
+        assert message.data == payload
+        assert message.length == len(payload)
 
     def test_exact_max_payload_no_extra_fragment(self):
         """A payload of exactly MAX_PAYLOAD bytes should produce 1 fragment."""
@@ -546,3 +543,132 @@ class TestPacketWriter:
         assert packet is not None
         assert packet.payload == payload
         assert packet.fragment_count == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MessageAssembler Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMessageAssembler:
+    def test_single_fragment_returns_message(self):
+        """A single-fragment packet should return a Message immediately."""
+        asm = MessageAssembler()
+        packet = Packet(
+            type=PacketType.Text, sequence=1, item_id=1,
+            fragment_index=0, fragment_count=1,
+            payload_length=5, payload=b"hello",
+        )
+        message = asm.assemble(packet)
+        assert message is not None
+        assert message.data == b"hello"
+
+    def test_two_fragment_reassembly(self):
+        """Two fragments for the same item_id should reassemble into one Message."""
+        asm = MessageAssembler()
+        frag0 = Packet(
+            type=PacketType.Video, sequence=1, item_id=10,
+            fragment_index=0, fragment_count=2,
+            payload_length=4, payload=b"AAAA",
+        )
+        frag1 = Packet(
+            type=PacketType.Video, sequence=2, item_id=10,
+            fragment_index=1, fragment_count=2,
+            payload_length=4, payload=b"BBBB",
+        )
+        assert asm.assemble(frag0) is None
+        message = asm.assemble(frag1)
+        assert message is not None
+        assert message.data == b"AAAABBBB"
+        assert message.length == 8
+        assert message.item_id == 10
+
+    def test_out_of_order_fragment_discards(self):
+        """Receiving fragment 2 before fragment 1 should discard the partial."""
+        asm = MessageAssembler()
+        frag0 = Packet(
+            type=PacketType.Audio, sequence=1, item_id=20,
+            fragment_index=0, fragment_count=3,
+            payload_length=2, payload=b"AA",
+        )
+        frag2 = Packet(
+            type=PacketType.Audio, sequence=3, item_id=20,
+            fragment_index=2, fragment_count=3,
+            payload_length=2, payload=b"CC",
+        )
+        assert asm.assemble(frag0) is None
+        assert asm.assemble(frag2) is None  # out of order, slot cleared
+
+    def test_non_zero_first_fragment_rejected(self):
+        """A new item starting with fragment_index != 0 should be rejected."""
+        asm = MessageAssembler()
+        packet = Packet(
+            type=PacketType.Text, sequence=1, item_id=30,
+            fragment_index=1, fragment_count=3,
+            payload_length=2, payload=b"XX",
+        )
+        assert asm.assemble(packet) is None
+
+    def test_slot_eviction_oldest(self):
+        """When all slots are full, the oldest should be evicted."""
+        asm = MessageAssembler(max_slots=2)
+        frag_a = Packet(
+            type=PacketType.Text, sequence=1, item_id=100,
+            fragment_index=0, fragment_count=2,
+            payload_length=1, payload=b"A",
+        )
+        frag_b = Packet(
+            type=PacketType.Text, sequence=2, item_id=200,
+            fragment_index=0, fragment_count=2,
+            payload_length=1, payload=b"B",
+        )
+        frag_c = Packet(
+            type=PacketType.Text, sequence=3, item_id=300,
+            fragment_index=0, fragment_count=2,
+            payload_length=1, payload=b"C",
+        )
+        asm.assemble(frag_a)
+        asm.assemble(frag_b)
+        asm.assemble(frag_c)  # should evict item_id=100 (oldest)
+
+        # item_id=100 was evicted, so its fragment 1 should start a new slot (rejected since index!=0)
+        frag_a1 = Packet(
+            type=PacketType.Text, sequence=4, item_id=100,
+            fragment_index=1, fragment_count=2,
+            payload_length=1, payload=b"X",
+        )
+        assert asm.assemble(frag_a1) is None
+
+    def test_cleanup_expires_stale_slots(self):
+        """cleanup() should discard partial messages older than the timeout."""
+        asm = MessageAssembler(timeout=0.0)  # immediate expiry
+        frag = Packet(
+            type=PacketType.Text, sequence=1, item_id=50,
+            fragment_index=0, fragment_count=2,
+            payload_length=3, payload=b"abc",
+        )
+        asm.assemble(frag)
+        asm.cleanup()
+
+        # The slot should be cleared, so fragment 1 won't find a match
+        frag1 = Packet(
+            type=PacketType.Text, sequence=2, item_id=50,
+            fragment_index=1, fragment_count=2,
+            payload_length=3, payload=b"def",
+        )
+        assert asm.assemble(frag1) is None
+
+    def test_three_fragment_reassembly(self):
+        """Three fragments should reassemble correctly."""
+        asm = MessageAssembler()
+        frags = [
+            Packet(type=PacketType.Video, sequence=i+1, item_id=42,
+                   fragment_index=i, fragment_count=3,
+                   payload_length=3, payload=bytes([i*3, i*3+1, i*3+2]))
+            for i in range(3)
+        ]
+        assert asm.assemble(frags[0]) is None
+        assert asm.assemble(frags[1]) is None
+        message = asm.assemble(frags[2])
+        assert message is not None
+        assert message.data == bytes(range(9))
+        assert message.length == 9
